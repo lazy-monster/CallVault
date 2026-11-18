@@ -101,6 +101,34 @@ class RewarmGateTest {
     }
 
     @Test
+    fun `a recorder that keeps dying is relaunched with a growing gap, even when forced`() {
+        // Samsung / OnePlus memory managers reaping the recorder over and over must not become a relaunch
+        // loop that keeps the phone busy.
+        val gate = gate()
+        assertTrue(gate.tryEnter(now = 0L, force = true)); gate.leave()
+        assertTrue(gate.tryEnter(now = 1_000L, force = true)); gate.leave() // first repeat: free
+
+        val first = RewarmGate.DEFAULT_FIRST_BACKOFF_MS
+        assertFalse(gate.tryEnter(now = 1_000L + first - 1, force = true))
+        assertTrue(gate.tryEnter(now = 1_000L + first, force = true)); gate.leave()
+
+        val t = 1_000L + first
+        assertFalse(gate.tryEnter(now = t + first * 2 - 1, force = true))
+        assertTrue(gate.tryEnter(now = t + first * 2, force = true)); gate.leave()
+    }
+
+    @Test
+    fun `the backoff is capped and resets once the recorder has stayed up`() {
+        val gate = gate()
+        assertTrue(gate.backoffFor(50) == RewarmGate.DEFAULT_MAX_BACKOFF_MS)
+        assertTrue(gate.tryEnter(now = 0L, force = true)); gate.leave()
+        assertTrue(gate.tryEnter(now = 1L, force = true)); gate.leave()
+        // stable for long enough: the next death is a fresh one, recovered at once
+        val later = 1L + RewarmGate.DEFAULT_STABLE_AFTER_MS
+        assertTrue(gate.tryEnter(now = later, force = true))
+    }
+
+    @Test
     fun `leave is safe when no attempt is in flight`() {
         val gate = gate()
 

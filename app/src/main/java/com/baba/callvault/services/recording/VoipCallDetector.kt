@@ -354,6 +354,11 @@ class VoipCallDetector(private val context: Context) {
                 autoStart = prefs.isVoipAutoStartEnabled(),
             )
             if (action == RecordingPolicy.VoipAction.OFFER) {
+                // Game voice chat (CODM, PUBG, …) is not a call: no "record this?" prompt mid-match.
+                if (VoipRecordingCoordinator.isCurrentCallAppAGame(context)) {
+                    AppLogger.i(TAG, "Call audio belongs to a game — not offering to record")
+                    return
+                }
                 // An ignored caller gets no prompt either (#51): asking "record this?" about someone the
                 // user listed to skip would make the list mean nothing.
                 if (VoipRecordingCoordinator.isCurrentCallerIgnored(context)) {
@@ -380,9 +385,12 @@ class VoipCallDetector(private val context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 audioManager.addOnModeChangedListener(executor, modeListener)
             }
-            // Registered on every version: on API 30 it is the only trigger, and above it is a cheap
-            // backstop in case a mode change is ever missed.
-            audioManager.registerAudioPlaybackCallback(playbackTrigger, handler)
+            // Only on API 30, where it is the only trigger. On 31+ the mode listener is authoritative, and
+            // this callback fires on every player start/stop on the phone — in a game, constantly — waking
+            // the app's main thread each time for a mode it already knows.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                audioManager.registerAudioPlaybackCallback(playbackTrigger, handler)
+            }
             registered = true
             AppLogger.i(TAG, "VoIP call detection active")
             evaluate(audioManager.mode)   // a call may already be in progress

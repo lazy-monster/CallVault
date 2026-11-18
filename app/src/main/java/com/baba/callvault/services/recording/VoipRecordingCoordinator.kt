@@ -154,6 +154,11 @@ object VoipRecordingCoordinator {
         // The app comes from the audio stream we are about to record, so it cannot be the wrong app;
         // the caller is then looked up scoped to THAT package, never across all notifications.
         val callPackage = resolveCallPackage(context, service, "start")
+        // Game voice chat holds the same audio mode as a call; it is never an app call (see VoipGameGuard).
+        if (!manual && VoipGameGuard.isGame(context, callPackage)) {
+            AppLogger.i(TAG, "Not recording: $callPackage is a game (voice chat, not a call).")
+            return
+        }
         val appLabel = callPackage?.let { appLabelFor(context, it) }
         val caller = callPackage?.let {
             runCatching { service.voipCallerName(it) }
@@ -380,7 +385,10 @@ object VoipRecordingCoordinator {
             val service = RecorderConnection.service ?: return@launch
             val pkg = runCatching { resolveCallPackage(context, service, "late") }.getOrNull() ?: continue
             if (!recording) return@launch
-            val excluded = AppPreferences(context).getVoipExcludedPackages()
+            // A game found late is treated exactly like an app the user switched off (see VoipGameGuard).
+            val excluded = AppPreferences(context).getVoipExcludedPackages().let { set ->
+                if (!manual && VoipGameGuard.isGame(context, pkg)) set + pkg else set
+            }
             // A switched-off app costs the whole call, so it is looked up a second time first.
             val second = if (VoipAppPolicy.shouldRecord(pkg, excluded)) null else {
                 delay(VoipLateCaller.CONFIRM_DELAY_MS)
@@ -388,7 +396,8 @@ object VoipRecordingCoordinator {
                 if (!recording) return@launch
                 runCatching { resolveCallPackage(context, service, "late") }.getOrNull()
             }
-            when (VoipLateCaller.verdict(pkg, second, excluded)) {
+            val excludedFinal = if (!manual && second != null && VoipGameGuard.isGame(context, second)) excluded + second else excluded
+            when (VoipLateCaller.verdict(pkg, second, excludedFinal)) {
                 VoipLateCaller.LateAppVerdict.UNSURE -> {
                     AppLogger.i(TAG, "Call app looked like $pkg (switched off), then $second; recording on, asking again later")
                     continue
@@ -988,6 +997,13 @@ object VoipRecordingCoordinator {
         val pkg = runCatching { resolveCallPackage(context, service) }.getOrNull() ?: return false
         val caller = runCatching { service.voipCallerName(pkg) }.getOrNull()
         return VoipIgnoredCallers.isIgnored(context, caller)
+    }
+
+    /** Whether the app holding the call audio right now is a game — its voice chat is not offered or recorded. */
+    fun isCurrentCallAppAGame(context: Context): Boolean {
+        val service = RecorderConnection.service ?: return false
+        val pkg = runCatching { resolveCallPackage(context, service) }.getOrNull() ?: return false
+        return VoipGameGuard.isGame(context, pkg)
     }
 
     fun currentCallAppLabel(context: Context): String? {

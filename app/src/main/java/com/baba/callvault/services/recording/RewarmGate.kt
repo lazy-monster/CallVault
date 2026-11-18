@@ -9,36 +9,23 @@
 package com.baba.callvault.services.recording
 
 /**
- * Decides whether a daemon relaunch may start now. Two rules, and one hard-won third.
+ * Serialises and throttles recorder relaunches.
  *
- *  - **One at a time.** Two concurrent launches disconnect and reconnect on each other mid-connect and
- *    thrash the embedded ADB connection into a "Stream closed" state.
- *  - **Throttled.** An un-forced (watchdog) attempt waits [throttleMs] after the last one, so a launch
- *    that keeps failing is not hammered. A confirmed binder death passes `force = true` and skips this
- *    — a genuine recovery must not sit out the throttle. Force does *not* skip the one-at-a-time rule.
- *  - **In-flight state expires.** This is the fix for the 2026-07-30 field wedge, and the reason this
- *    logic is a separate testable class rather than two fields on the service.
- *
- * The wedge: the in-flight flag used to be cleared *only* by the worker thread finishing. That worker
- * calls `ensureServerRunning`, which could block indefinitely on a half-dead ADB connection — so a
- * single hung attempt latched the flag true for the life of the process, the 60 s watchdog returned at
- * its first line forever, and recording stopped silently. Found after ~21 hours down on a device that
- * otherwise looked perfectly healthy. Treating an attempt older than [stuckAfterMs] as abandoned means
- * the worst case is one lost window, not a permanent outage.
- *
- * Thread-safe: [tryEnter] is called from the watchdog's handler thread while [leave] is called from the
- * relaunch worker it spawned, so the state genuinely crosses threads and both methods are synchronized.
- * Without that, the handler thread could keep observing a stale `inFlight = true` and wait out
- * [stuckAfterMs] before retrying a relaunch that had in fact already finished.
- *
- * @param stuckAfterMs age past which an in-flight attempt is presumed abandoned and may be superseded.
- *   Must comfortably exceed a healthy `ensureServerRunning`, or a slow-but-working launch gets a
- *   competitor.
- * @param throttleMs minimum gap between un-forced attempts.
+ * **Crash-loop backoff.** A forced relaunch (binder death) used to bypass the throttle entirely. On phones
+ * whose memory manager reaps the shell-uid recorder repeatedly (Samsung's Freecess / Game Booster under load,
+ * OnePlus Athena), that meant: reaped → relaunched at once → reaped again, forever. Every relaunch is an ADB
+ * round trip, an `app_process` cold start and, in the worst case, Wireless debugging being switched back on —
+ * which is exactly what made phones sluggish. Now any attempt that comes within [stableAfterMs] of the
+ * previous one counts as a repeat, and repeats wait an exponentially growing gap (capped at [maxBackoffMs])
+ * whether forced or not. The first relaunch after a recorder that stayed up, and the first repeat after it,
+ * still happen immediately: a single death is recovered before the next call, a loop is not fed.
  */
 class RewarmGate(
     private val stuckAfterMs: Long,
     private val throttleMs: Long,
+    private val stableAfterMs: Long = DEFAULT_STABLE_AFTER_MS,
+    private val firstBackoffMs: Long = DEFAULT_FIRST_BACKOFF_MS,
+    private val maxBackoffMs: Long = DEFAULT_MAX_BACKOFF_MS,
 ) {
 
     private var inFlight = false
@@ -50,17 +37,19 @@ class RewarmGate(
     private var hasAttempted = false
     private var lastAttemptAtMs = 0L
 
-    /**
-     * Claims the right to start a relaunch, returning false if the caller should stand down.
-     *
-     * @param now monotonic milliseconds (`SystemClock.elapsedRealtime`), never wall clock — a clock
-     *   change must not open or close this gate.
-     * @param force skip the throttle for a confirmed binder death.
-     */
+    /** Attempts in a row that each came soon after the previous one. 0 = the recorder had been stable. */
+    private var repeatStreak = 0
+
     @Synchronized
     fun tryEnter(now: Long, force: Boolean): Boolean {
         if (inFlight && now - startedAtMs < stuckAfterMs) return false
-        if (!force && hasAttempted && now - lastAttemptAtMs < throttleMs) return false
+        if (hasAttempted) {
+            val since = now - lastAttemptAtMs
+            val streak = if (since >= stableAfterMs) 0 else repeatStreak + 1
+            val required = maxOf(if (force) 0L else throttleMs, backoffFor(streak))
+            if (since < required) return false
+            repeatStreak = streak
+        }
         inFlight = true
         startedAtMs = now
         hasAttempted = true
@@ -68,9 +57,25 @@ class RewarmGate(
         return true
     }
 
-    /** Marks the in-flight attempt finished. Idempotent, so it is safe in a `finally`. */
     @Synchronized
     fun leave() {
         inFlight = false
+    }
+
+    /**
+     * The gap a relaunch must wait after [streak] quick repeats. The first repeat is free (one genuine death
+     * still recovers at once, before the next call); from the second on: first, doubling, capped.
+     */
+    internal fun backoffFor(streak: Int): Long {
+        if (streak <= 1) return 0L
+        val shift = (streak - 2).coerceAtMost(20)
+        return (firstBackoffMs shl shift).coerceAtMost(maxBackoffMs)
+    }
+
+    companion object {
+        /** A recorder that has not needed a relaunch for this long counts as healthy again. */
+        const val DEFAULT_STABLE_AFTER_MS = 10 * 60_000L
+        const val DEFAULT_FIRST_BACKOFF_MS = 15_000L
+        const val DEFAULT_MAX_BACKOFF_MS = 15 * 60_000L
     }
 }

@@ -23,7 +23,8 @@ import com.baba.callvault.server.RecorderConnection
  */
 object UsbDebuggingShellRead {
 
-    private const val FRESH_MS = 2 * 60_000L
+    // Outlives the keep-alive's re-read interval (every 5th one-minute tick), so a read stays known between refreshes.
+    private const val FRESH_MS = 6 * 60_000L
 
     @Volatile private var value: Boolean? = null
     @Volatile private var readAtMs = 0L

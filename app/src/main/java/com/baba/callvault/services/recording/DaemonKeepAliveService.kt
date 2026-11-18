@@ -89,6 +89,10 @@ class DaemonKeepAliveService : Service() {
     /** Consecutive "daemon down" readings — we only relaunch after a couple, to not churn on a blip. */
     private var downStreak = 0
 
+    /** Watchdog ticks so far, and the recorder state at the last one — to space out diagnostic reads. */
+    private var tick = 0L
+    private var lastTickAlive: Boolean? = null
+
     private val watchdog = object : Runnable {
         override fun run() {
             val alive = isDaemonAlive()
@@ -120,8 +124,13 @@ class DaemonKeepAliveService : Service() {
                 // binder blip doesn't trigger a relaunch (which would kill+respawn a daemon that was fine).
                 if (downStreak >= DOWN_STREAK_THRESHOLD) maybeRewarm()
             }
-            if (alive && usesAdb()) refreshShellUsbRead()
-            if (usesAdb()) timelineSnapshot(alive, "tick")
+            // Diagnostics only, so not every minute: each of these starts a thread, and the USB read is a
+            // round trip into the recorder. Every Nth tick, plus whenever the recorder's state just changed.
+            tick++
+            val changed = alive != lastTickAlive
+            lastTickAlive = alive
+            if (alive && usesAdb() && (changed || tick % USB_READ_EVERY_TICKS == 0L)) refreshShellUsbRead()
+            if (usesAdb() && (changed || tick % TIMELINE_EVERY_TICKS == 0L)) timelineSnapshot(alive, "tick")
             healSharedNotice()
             watchdogHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
         }
@@ -1004,6 +1013,12 @@ class DaemonKeepAliveService : Service() {
 
         /** How often the watchdog checks the daemon is alive. Cheap (a binder ping). */
         private const val WATCHDOG_INTERVAL_MS = 60_000L
+
+        /** Re-read USB debugging through the recorder every this many ticks (it is also read on change). */
+        private const val USB_READ_EVERY_TICKS = 5L
+
+        /** Write an unchanged-state timeline line every this many ticks. */
+        private const val TIMELINE_EVERY_TICKS = 15L
 
         /** How long after a release the posted notification is checked again. Covers a late system_server post. */
         private const val SHARED_NOTICE_HEAL_DELAY_MS = 1_500L
